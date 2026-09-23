@@ -64,9 +64,14 @@ export class ApiClient {
   private dir = 'data/api';
   public requests = 0;
   public views = 0;
+  // false = always hit the network (snapshots are still written). The crawler
+  // needs this: a pending question's cached response may be one fetched while
+  // the session was dead, and replaying it would save that empty body as done.
+  private readCache: boolean;
 
-  constructor(statePath = '.secrets/storageState.json', viewIntervalMs = 600, auxIntervalMs = 400) {
+  constructor(statePath = '.secrets/storageState.json', viewIntervalMs = 600, auxIntervalMs = 400, readCache = true) {
     this.cookie = loadCookieHeader(statePath);
+    this.readCache = readCache;
     this.viewInterval = viewIntervalMs;
     this.auxInterval = auxIntervalMs;
     mkdirSync(this.dir, { recursive: true });
@@ -101,7 +106,7 @@ export class ApiClient {
   ): Promise<any> {
     const key = createHash('sha256').update(path).digest('hex').slice(0, 16);
     const file = `${this.dir}/${kind}_${key}.json.gz`;
-    if (cache && existsSync(file)) {
+    if (cache && this.readCache && existsSync(file)) {
       const { gunzipSync } = await import('node:zlib');
       return JSON.parse(gunzipSync(readFileSync(file)).toString('utf8'));
     }

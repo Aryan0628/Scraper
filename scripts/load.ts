@@ -129,7 +129,8 @@ for (const slug of slugs) {
         kind: ENUM_KIND.has(q.qtype ?? '') ? q.qtype : q.qtype ? 'other' : null,
         difficulty: q.difficulty,
         difficulty_score: q.difficulty_score,
-        is_premium: q.premium_required,
+        // API flag when we have the body; the company page's only as a placeholder.
+        is_premium: b ? Boolean(b.premium_required) : q.premium_required,
         has_image: b?.has_image ?? false,
         publication_status: b?.publication_status ?? 'published',
         is_mock_oa: b?.is_mock_oa ?? false,
@@ -155,7 +156,10 @@ for (const slug of slugs) {
         title = EXCLUDED.title, title_norm = EXCLUDED.title_norm,
         kind = EXCLUDED.kind, difficulty = EXCLUDED.difficulty,
         difficulty_score = EXCLUDED.difficulty_score,
-        is_premium = EXCLUDED.is_premium,
+        is_premium = CASE WHEN EXCLUDED.body_fetched_at IS NOT NULL OR core.questions.body_fetched_at IS NULL
+                          THEN EXCLUDED.is_premium ELSE core.questions.is_premium END,
+        is_mock_oa = CASE WHEN EXCLUDED.body_fetched_at IS NOT NULL
+                          THEN EXCLUDED.is_mock_oa ELSE core.questions.is_mock_oa END,
         answers_locked = EXCLUDED.answers_locked,
         content_hash = COALESCE(EXCLUDED.content_hash, core.questions.content_hash),
         body_fetched_at = COALESCE(EXCLUDED.body_fetched_at, core.questions.body_fetched_at),

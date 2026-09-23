@@ -60,7 +60,9 @@ for (const sig of ['SIGTERM', 'SIGINT'] as const) {
   process.on(sig, () => { log(`${sig} received -- stopping after current item`); stopping = true; });
 }
 
-const sitemap: string[] = existsSync('data/sitemap_urls.json')
+// Local cache only (absent in the container). refreshSitemapAndSlugs replaces
+// it with the live sitemap, which is what phase 1.5 must seed from.
+let sitemap: string[] = existsSync('data/sitemap_urls.json')
   ? JSON.parse(readFileSync('data/sitemap_urls.json', 'utf8'))
   : [];
 const slugById = new Map<string, string>();
@@ -75,6 +77,7 @@ async function refreshSitemapAndSlugs(f: Fetcher): Promise<string[]> {
   const urls = [...res.html.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) =>
     m[1].replace('https://www.oahelper.in', ''),
   );
+  sitemap = urls;
   for (const u of urls) {
     const m = /^\/problems\/([^/]+)\/(.+)$/.exec(u);
     if (m) slugById.set(m[1], m[2]);
@@ -148,6 +151,12 @@ async function seedSitemapProblems(): Promise<number> {
         .map((tok) => [tok, { source_id: tok, source_numeric_id: decode(tok), title: tok, title_norm: tok, slug: tok, is_premium: false }]),
     ).values(),
   ];
+  // 0 here means the sitemap never loaded, not "nothing new" -- a silent 0 once
+  // left ~5k uncatalogued questions out of the worklist on every container run.
+  if (!rows.length) {
+    log('  WARNING: phase 1.5 found no /problems/ URLs in the sitemap -- worklist is incomplete');
+    return 0;
+  }
   let seeded = 0;
   for (let i = 0; i < rows.length; i += 500) {
     const chunk = rows.slice(i, i + 500);
@@ -163,28 +172,55 @@ async function seedSitemapProblems(): Promise<number> {
 // ---------------------------------------------------------------- phase 2
 class SessionDead extends Error {}
 
-/** Returns 'complete' | 'rate_limited' | 'interrupted' | 'session_dead'. */
+/**
+ * Account status behind OA_SESSION (uncapped, not a content view). A dead cookie
+ * may answer 401/403 rather than is_premium=false; both mean "session dead".
+ * Network errors still throw, so a blip is never mistaken for a dead session.
+ */
+async function accountStatus(api: ApiClient): Promise<any> {
+  try {
+    return await api.premiumStatus();
+  } catch (e) {
+    if (/HTTP 40[13]/.test(String(e))) return null;
+    throw e;
+  }
+}
+const sessionAlive = async (api: ApiClient) => (await accountStatus(api))?.is_premium === true;
+
+/** Returns 'complete' | 'interrupted' | 'session_dead'. */
 async function drainBodies(runId: number): Promise<string> {
-  const api = new ApiClient('.secrets/storageState.json', VIEW_INTERVAL_MS, 400);
-  const status = await api.premiumStatus();
-  log(`phase 2: session premium=${status?.is_premium} plan=${status?.subscription?.subscription_type ?? '-'}`);
-  if (!status?.is_premium) {
-    log('  WARNING: session is not premium -- premium bodies will be gated. Refresh OA_SESSION.');
+  // readCache=false: never replay a snapshot that may have been taken while the
+  // session was dead -- that would save an empty body as done.
+  const api = new ApiClient('.secrets/storageState.json', VIEW_INTERVAL_MS, 400, false);
+  const status = await accountStatus(api);
+  log(`phase 2: session premium=${status?.is_premium} plan=${status?.subscription?.subscription_type ?? '-'} expires=${(status?.subscription?.end_date ?? '-').slice(0, 10)}`);
+  if (status?.is_premium !== true) {
+    log('  SESSION DEAD: account is not premium (expired login or subscription). Refresh OA_SESSION and restart the job. No bodies fetched.');
+    return 'session_dead';
   }
 
   const [{ n: pending }] = await sql`SELECT count(*)::int n FROM core.questions WHERE body_fetched_at IS NULL AND deleted_at IS NULL`;
   log(`  worklist: ${pending} questions owe a body (paced ~${(VIEW_INTERVAL_MS / 1000).toFixed(0)}s each => ~${(pending * VIEW_INTERVAL_MS / 3.6e6).toFixed(1)}h)`);
 
   let fetched = 0;
+  let mismatches = 0;
+  const flush = () => sql`UPDATE ingest.crawl_runs SET bodies_fetched = ${fetched} WHERE id = ${runId}`;
   while (!stopping) {
     // Re-query each pass: self-healing (picks up new rows, skips done ones).
+    // is_premium on a pending row is still the company page's flag (the API
+    // value replaces it on save), and `catalogued` tells a real company-page flag
+    // apart from a sitemap-seeded placeholder.
     const work: any[] = await sql`
-      SELECT id, source_id, source_numeric_id, kind
-      FROM core.questions
-      WHERE body_fetched_at IS NULL AND deleted_at IS NULL
-      ORDER BY is_premium DESC, id
+      SELECT q.id, q.source_id, q.source_numeric_id, q.kind, q.is_premium AS catalog_premium,
+             EXISTS (SELECT 1 FROM core.company_questions cq WHERE cq.question_id = q.id) AS catalogued
+      FROM core.questions q
+      WHERE q.body_fetched_at IS NULL AND q.deleted_at IS NULL
+      ORDER BY q.is_premium DESC, q.id
       LIMIT ${BATCH}`;
-    if (!work.length) { log('phase 2 done: worklist empty'); return 'complete'; }
+    if (!work.length) {
+      log(`phase 2 done: worklist empty (${mismatches} premium-rule mismatches this run)`);
+      return 'complete';
+    }
 
     for (const q of work) {
       if (stopping) return 'interrupted';
@@ -197,31 +233,50 @@ async function drainBodies(runId: number): Promise<string> {
         const images = d.has_image ? await api.getImages(q.source_id) : [];
         const row = fromApiQuestion(d, mcq.items, images, mcq.locked);
 
-        // Premium assertion: a gated premium row with no statement means the
-        // session died. Stop loudly rather than silently marking it done.
-        if (row.is_premium && !row.body_present && !row.answers_locked) {
-          throw new SessionDead(`premium ${q.source_id} returned no statement`);
+        // An empty statement is either a genuinely empty question or a dead
+        // session. Ask the account, not the question's flags: premium_required
+        // misses mock-OA questions and sitemap-only rows have no company flag.
+        if (!row.body_present && !(await sessionAlive(api))) {
+          throw new SessionDead(`${q.source_id} returned no statement and the account is no longer premium`);
         }
+
+        // The company page's lock appears to be premium_required OR is_mock_oa
+        // (verified on Cisco only). Log disagreements so the backfill tests it.
+        if (q.catalogued && q.catalog_premium !== (row.premium_required || row.is_mock_oa)) {
+          mismatches++;
+          log(`  premium-rule mismatch: ${q.source_id} company=${q.catalog_premium} api=${row.premium_required} mock_oa=${row.is_mock_oa}`);
+        }
+
         // Fills catalog fields + company + topics + body, so it completes both
         // pre-catalogued rows and bare sitemap-seeded rows.
         await upsertQuestionFromApi(sql, row);
         fetched++;
         if (fetched % 20 === 0) {
           log(`  bodies: +${fetched} this run (views=${api.views})`);
-          await sql`UPDATE ingest.crawl_runs SET bodies_fetched = ${fetched} WHERE id = ${runId}`;
+          await flush();
         }
       } catch (e) {
         if (e instanceof RateLimited) {
           const wait = (e.retryAfterSec + 30) * 1000;
           log(`  rate limited (${fetched} fetched this run). sleeping ${(wait / 60000).toFixed(0)}min, then resuming.`);
-          await sql`UPDATE ingest.crawl_runs SET bodies_fetched = ${fetched} WHERE id = ${runId}`;
-          // Sleep in short slices so SIGTERM stays responsive.
-          for (let slept = 0; slept < wait && !stopping; slept += 5000) await sleep(5000);
+          await flush();
+          // Sleep in short slices so SIGTERM stays responsive; log every 5 min
+          // so the job's logs show it is waiting, not hung.
+          for (let slept = 0; slept < wait && !stopping; slept += 5000) {
+            await sleep(5000);
+            if (slept > 0 && slept % 300_000 === 0) log(`  rate limited: resuming in ~${((wait - slept) / 60000).toFixed(0)}min`);
+          }
           break; // re-query the worklist and continue
         }
         if (e instanceof SessionDead) {
-          log(`  SESSION DEAD: ${e.message}. Refresh OA_SESSION and restart. Stopping.`);
-          await sql`UPDATE ingest.crawl_runs SET bodies_fetched = ${fetched} WHERE id = ${runId}`;
+          log(`  SESSION DEAD: ${e.message}. Refresh OA_SESSION and restart the job. Stopping.`);
+          await flush();
+          return 'session_dead';
+        }
+        // A refused fetch may be the session dying rather than this question.
+        if (/HTTP 40[13]/.test(String(e)) && !(await sessionAlive(api))) {
+          log(`  SESSION DEAD: ${q.source_id} refused (${String(e).slice(0, 60)}) and the account is no longer premium. Refresh OA_SESSION and restart the job. Stopping.`);
+          await flush();
           return 'session_dead';
         }
         log(`  ! ${q.source_id}: ${String(e).slice(0, 160)}`); // transient; leave pending, retry next pass
@@ -289,10 +344,9 @@ try {
     if (!stopping) await seedSitemapProblems(); // complete the worklist
   }
   if (doBodies && !stopping) reason = await drainBodies(runId);
-  // Experiences run even if bodies hit rate_limit: they are uncapped and cheap,
-  // so a rate-limited body pass shouldn't leave experiences stale. Skip only on
-  // session_dead (auth is broken) or interrupt.
-  if (doExperiences && !stopping && reason !== 'session_dead') await crawlExperiences(runId);
+  // Experiences need no login, so they run even when the session is dead; the
+  // run still exits 1 afterwards so the dead session is not missed.
+  if (doExperiences && !stopping) await crawlExperiences(runId);
   if (stopping && reason === 'complete') reason = 'interrupted';
 } catch (e) {
   reason = 'error';

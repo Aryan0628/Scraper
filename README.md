@@ -90,14 +90,20 @@ gcloud builds submit --tag gcr.io/YOUR_PROJECT/oascraper
 gcloud run jobs create oascraper-daily \
   --image gcr.io/YOUR_PROJECT/oascraper \
   --region asia-south1 \
-  --task-timeout 3600 \
+  --task-timeout 86400 \
   --max-retries 1 \
   --set-secrets DATABASE_URL=oascraper-db-url:latest,OA_SESSION=oascraper-session:latest \
   --command node --args scripts/crawl.ts,daily
 ```
 
 Change the last arg to `backfill` for the first full run, then switch to `daily`
-for subsequent scheduled runs. Other modes: `catalog`, `bodies`, `experiences`
+for subsequent scheduled runs.
+
+`--task-timeout 86400` (24h) is deliberate: bodies are paced at ~26s each
+(~3,300 per day), and on a 429 the crawler sleeps `Retry-After` + 30s (about an
+hour, logging every 5 min) inside the run, then resumes. A 1-hour timeout would
+kill it mid-sleep. The full backfill (~9k bodies) takes about 3 executions;
+start each with `gcloud run jobs execute oascraper-daily --region asia-south1`. Other modes: `catalog`, `bodies`, `experiences`
 (each phase in isolation).
 
 ### 4. Schedule it
@@ -110,6 +116,31 @@ gcloud scheduler jobs create http oascraper-nightly \
   --http-method POST \
   --oauth-service-account-email SCHEDULER_SA@YOUR_PROJECT.iam.gserviceaccount.com
 ```
+
+Create the scheduler only **after the backfill has finished**. Two executions
+running at once share the 150/hour view cap and rate-limit each other.
+
+### 5. When a run fails with `SESSION DEAD`
+
+The crawler checks the account at the start of the body phase and again whenever
+a question comes back empty. If the login or the subscription has lapsed, it
+logs `SESSION DEAD`, saves nothing for that question, and exits 1 (the execution
+shows as *Failed*). It does **not** retry: a dead session does not recover by
+waiting. Company pages and interview experiences still run, as they need no login.
+
+To recover:
+
+```bash
+node scripts/login.ts
+base64 -i .secrets/storageState.json \
+  | gcloud secrets versions add oascraper-session --data-file=-
+gcloud run jobs execute oascraper-daily --region asia-south1
+```
+
+The worklist resumes where it stopped. Until you do this, each scheduled run
+fails the same way within seconds of reaching the body phase; to silence it,
+`gcloud scheduler jobs pause oascraper-nightly --location asia-south1` (and
+`resume` afterwards).
 
 ### What GOOGLE never sees
 

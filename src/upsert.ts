@@ -73,7 +73,10 @@ export async function upsertCatalog(
         title = EXCLUDED.title, title_norm = EXCLUDED.title_norm,
         kind = EXCLUDED.kind, difficulty = EXCLUDED.difficulty,
         difficulty_score = EXCLUDED.difficulty_score,
-        is_premium = EXCLUDED.is_premium,
+        -- The company page's flag is only a placeholder until the body fetch
+        -- writes the API's premium_required; never overwrite the API value.
+        is_premium = CASE WHEN core.questions.body_fetched_at IS NULL
+                          THEN EXCLUDED.is_premium ELSE core.questions.is_premium END,
         source_updated_at = COALESCE(EXCLUDED.source_updated_at, core.questions.source_updated_at),
         updated_at = now()
       RETURNING id, source_id`;
