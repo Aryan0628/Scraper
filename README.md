@@ -1,11 +1,5 @@
 # scraper
 
-Research scraper for **oahelper.in**, run with written permission from Next Wave.
-Builds a dataset of Online Assessment questions per company to study the variety
-of questions asked (topic mix, difficulty spread, cross-company reuse).
-
-Keep the permission record in `docs/permission.md`. Aggregates are shareable;
-scraped premium statements and solutions are internal only.
 
 ## Setup
 
