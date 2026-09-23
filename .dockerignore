@@ -1,0 +1,10 @@
+node_modules
+.secrets
+data
+fixtures
+*.log
+.env
+.git
+scripts/*.bak
+scripts/load.ts.bak
+docs

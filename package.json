@@ -1,0 +1,21 @@
+{
+  "name": "oascraper",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Authorised research scraper for oahelper.in (permission: Next Wave)",
+  "scripts": {
+    "login": "node scripts/login.ts",
+    "slice": "node scripts/slice.ts",
+    "check": "node scripts/check-flight.ts",
+    "migrate": "node scripts/migrate.ts",
+    "load": "node scripts/load.ts"
+  },
+  "dependencies": {
+    "playwright-core": "^1.63.0",
+    "postgres": "^3.4.9"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2"
+  }
+}

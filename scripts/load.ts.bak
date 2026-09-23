@@ -1,0 +1,307 @@
+/**
+ * Load scraped slices into Postgres. Idempotent: every write upserts on a
+ * natural key, so re-running after another crawl is safe.
+ *
+ * Columns that require a derivation pass (canonical_id, company_id on
+ * experiences, normalised result, role/college lookups) are nullable and left
+ * NULL here -- loading does not depend on them.
+ *
+ *   export DATABASE_URL=postgresql://...
+ *   node scripts/load.ts                      # all slices found on disk
+ *   node scripts/load.ts --company=accenture  # just one
+ */
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import postgres from 'postgres';
+
+const url = process.env.DATABASE_URL;
+if (!url) {
+  console.error('DATABASE_URL is not set (see .env.example)');
+  process.exit(1);
+}
+const only = process.argv.find((a) => a.startsWith('--company='))?.split('=')[1];
+// idle_timeout + max_lifetime keep the pooled connection from lingering after
+// the last query, which is what left the process hanging after a successful
+// load. prepare:false avoids statement-name churn against Neon's pooler.
+const sql = postgres(url, {
+  onnotice: () => {},
+  max: 4,
+  idle_timeout: 5,
+  max_lifetime: 60,
+  prepare: false,
+});
+
+const read = <T>(p: string): T | null => (existsSync(p) ? (JSON.parse(readFileSync(p, 'utf8')) as T) : null);
+const slugs = (only ? [only] : readdirSync('data').filter((d) => d.startsWith('slice_')).map((d) => d.slice(6)));
+
+// Problem slugs live in the sitemap URL, not in the payload.
+const sitemap = (read<string[]>('data/sitemap_urls.json') ?? []);
+const slugById = new Map<string, string>();
+for (const u of sitemap) {
+  const m = /^\/problems\/([^/]+)\/(.+)$/.exec(u);
+  if (m) slugById.set(m[1], m[2]);
+}
+
+const hash = (s: string) => createHash('sha256').update(s).digest('hex');
+const ENUM_KIND = new Set(['coding', 'mcq', 'sql', 'subjective', 'other']);
+const ENUM_CAMPUS = new Set(['on_campus', 'off_campus']);
+
+// Topics are shared across questions; resolve each name to its id once.
+const topicCache = new Map<string, number>();
+async function ensureTopic(name: string): Promise<number> {
+  const [t] = await sql`
+    INSERT INTO core.topics (name) VALUES (${name})
+    ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id`;
+  topicCache.set(name, t.id);
+  return t.id;
+}
+
+let nC = 0, nQ = 0, nB = 0, nCode = 0, nItems = 0, nOpts = 0, nTopics = 0, nLinks = 0, nImg = 0;
+
+for (const slug of slugs) {
+  const dir = `data/slice_${slug}`;
+  const company = read<any>(`${dir}/company.json`);
+  const questions = read<any[]>(`${dir}/questions.json`) ?? [];
+  const bodies = read<any[]>(`${dir}/bodies_api.json`) ?? read<any[]>(`${dir}/bodies.json`) ?? [];
+  if (!company) continue;
+
+  const [c] = await sql`
+    INSERT INTO core.companies (
+      slug, name, source_id, solutions_available, premium_only, has_free_questions,
+      recent_questions, source_date, source_created_at, source_updated_at,
+      source_payload, updated_at)
+    VALUES (
+      ${company.slug}, ${company.name}, ${company.source_id},
+      ${company.solutions_available ?? false}, ${company.premium_only ?? null},
+      ${company.has_free_questions ?? null},
+      ${sql.json(company.recent_questions ?? null)}, ${company.date ?? null},
+      ${company.source_created_at ?? null}, ${company.source_updated_at ?? null},
+      ${sql.json(company)}, now())
+    ON CONFLICT (slug) DO UPDATE SET
+      name = EXCLUDED.name,
+      solutions_available = EXCLUDED.solutions_available,
+      premium_only = EXCLUDED.premium_only,
+      recent_questions = EXCLUDED.recent_questions,
+      source_updated_at = EXCLUDED.source_updated_at,
+      source_payload = EXCLUDED.source_payload,
+      updated_at = now()
+    RETURNING id, name`;
+  nC++;
+
+  // Record the source's own counts as observations, never as truth.
+  for (const [metric, value] of [
+    ['question_count', company.question_count],
+    ['free_question_count', company.free_question_count],
+    ['premium_question_count', company.premium_question_count],
+  ] as [string, number | null][]) {
+    if (value === null || value === undefined) continue;
+    await sql`INSERT INTO ingest.source_counts (scope, scope_key, metric, value)
+              VALUES ('company', ${company.slug}, ${metric}, ${value})
+              ON CONFLICT DO NOTHING`;
+  }
+
+  const bodyBySource = new Map(bodies.map((b) => [b.source_id, b]));
+
+  for (const q of questions) {
+    const b = bodyBySource.get(q.source_id);
+    const kind = ENUM_KIND.has(q.qtype ?? '') ? q.qtype : q.qtype ? 'other' : null;
+    const statement = b?.body?.problem_statement_md ?? b?.body?.problem_statement_html ?? '';
+
+    const [row] = await sql`
+      INSERT INTO core.questions (
+        slug, title, title_norm, kind, difficulty, difficulty_score,
+        is_premium, has_image, publication_status, is_mock_oa, answers_locked, is_first_in_company,
+        source_id, source_numeric_id, content_hash, body_fetched_at,
+        source_created_at, source_updated_at, source_payload, updated_at)
+      VALUES (
+        ${slugById.get(q.source_id) ?? q.title_norm.replace(/\s+/g, '-')},
+        ${q.title}, ${q.title_norm}, ${kind},
+        ${q.difficulty}, ${q.difficulty_score},
+        ${q.premium_required}, ${b?.has_image ?? false},
+        ${b?.publication_status ?? 'published'},
+        ${b?.is_mock_oa ?? false}, ${b?.answers_locked ?? false}, ${b?.is_first_in_company ?? null},
+        ${q.source_id}, ${q.numeric_id},
+        ${statement ? hash(statement) : null},
+        ${b?.body_present ? new Date() : null},
+        ${b?.source_created_at ?? null},
+        ${b?.source_updated_at ?? q.source_updated_at ?? null},
+        ${b?.source_payload ? sql.json(b.source_payload) : null}, now())
+      ON CONFLICT (source_id) DO UPDATE SET
+        title = EXCLUDED.title, title_norm = EXCLUDED.title_norm,
+        kind = EXCLUDED.kind, difficulty = EXCLUDED.difficulty,
+        difficulty_score = EXCLUDED.difficulty_score,
+        is_premium = EXCLUDED.is_premium,
+        content_hash = COALESCE(EXCLUDED.content_hash, core.questions.content_hash),
+        -- COALESCE, not overwrite: a later catalog-only pass must not erase the
+        -- fact that we already paid quota to fetch this body.
+        body_fetched_at = COALESCE(EXCLUDED.body_fetched_at, core.questions.body_fetched_at),
+        source_created_at = COALESCE(EXCLUDED.source_created_at, core.questions.source_created_at),
+        source_updated_at = COALESCE(EXCLUDED.source_updated_at, core.questions.source_updated_at),
+        source_payload = COALESCE(EXCLUDED.source_payload, core.questions.source_payload),
+        updated_at = now()
+      RETURNING id`;
+    nQ++;
+
+    const campus = ENUM_CAMPUS.has(b?.campus_type ?? '') ? b.campus_type : null;
+    await sql`
+      INSERT INTO core.company_questions
+        (company_id, question_id, role_raw, college_raw, campus_type,
+         asked_on, sort_order, source_url)
+      VALUES (${c.id}, ${row.id}, ${b?.role ?? null}, ${b?.college_name ?? null},
+              ${campus}, ${q.date_added}, ${q.sort_order},
+              ${slugById.get(q.source_id) ? `/problems/${q.source_id}/${slugById.get(q.source_id)}` : null})
+      ON CONFLICT (company_id, question_id, coalesce(role_id, 0), coalesce(college_id, 0))
+      DO UPDATE SET asked_on = EXCLUDED.asked_on, sort_order = EXCLUDED.sort_order,
+                    role_raw = EXCLUDED.role_raw, college_raw = EXCLUDED.college_raw`;
+    nLinks++;
+
+    // All of a question's child rows are independent of one another and only
+    // depend on row.id, so fire them concurrently. postgres.js pipelines these
+    // over one connection, turning ~15 sequential 525ms round-trips per question
+    // into roughly one. (Topics resolve first because question_topics needs the
+    // topic id.) This is the difference between a 4-minute load and a ~15s one.
+    const jobs: Promise<unknown>[] = [];
+
+    for (const t of q.tags ?? []) {
+      const name = String(t).toLowerCase().trim();
+      const id = topicCache.get(name) ?? (await ensureTopic(name));
+      jobs.push(
+        sql`INSERT INTO core.question_topics (question_id, topic_id, source)
+            VALUES (${row.id}, ${id}, 'source') ON CONFLICT DO NOTHING`,
+      );
+      nTopics++;
+    }
+
+    if (b?.body_present) {
+      jobs.push(sql`
+        INSERT INTO core.question_bodies (
+          question_id, google_doc_link, statement_html, statement_md, editorial,
+          input_test_case, output_test_case, hidden_test_cases_ref,
+          hidden_test_cases_count, youtube_tutorial, visual_animation)
+        VALUES (${row.id}, ${b.body.google_doc_link ?? null},
+                ${b.body.problem_statement_html}, ${b.body.problem_statement_md},
+                ${b.body.editorial}, ${b.body.input_test_case}, ${b.body.output_test_case},
+                ${b.body.hidden_test_cases_ref}, ${b.body.hidden_test_cases_blob_count},
+                ${b.body.youtube_tutorial}, ${b.body.visual_animation})
+        ON CONFLICT (question_id) DO UPDATE SET
+          statement_html = EXCLUDED.statement_html,
+          statement_md = EXCLUDED.statement_md,
+          editorial = EXCLUDED.editorial`);
+      nB++;
+
+      for (const cd of b.code ?? []) {
+        jobs.push(sql`INSERT INTO core.question_code (question_id, kind, lang, code)
+                  VALUES (${row.id}, ${cd.kind}, ${cd.lang}, ${cd.code})
+                  ON CONFLICT (question_id, kind, lang) DO UPDATE SET code = EXCLUDED.code`);
+        nCode++;
+      }
+      // Options depend on their mcq_item (composite FK), so those await first.
+      for (const it of b.mcq_items ?? []) {
+        await sql`INSERT INTO core.question_mcq_items
+                    (question_id, mcq_index, stem, selection_type, solution_explanation)
+                  VALUES (${row.id}, ${it.mcq_index}, ${it.stem}, ${it.selection_type},
+                          ${it.solution_explanation})
+                  ON CONFLICT (question_id, mcq_index) DO UPDATE SET
+                    stem = EXCLUDED.stem,
+                    solution_explanation = EXCLUDED.solution_explanation`;
+        nItems++;
+      }
+      for (const im of b.images ?? []) {
+        jobs.push(sql`INSERT INTO core.question_images (question_id, image_id, uploaded_at, ordinal)
+                  VALUES (${row.id}, ${im.image_id}, ${im.uploaded_at}, ${im.ordinal})
+                  ON CONFLICT (question_id, image_id) DO UPDATE SET ordinal = EXCLUDED.ordinal`);
+        nImg++;
+      }
+      for (const o of b.mcq_options ?? []) {
+        jobs.push(sql`INSERT INTO core.question_options (question_id, mcq_index, label, body, is_correct)
+                  VALUES (${row.id}, ${o.mcq_index}, ${o.label}, ${o.body}, ${o.is_correct})
+                  ON CONFLICT (question_id, mcq_index, label) DO UPDATE SET
+                    body = EXCLUDED.body, is_correct = EXCLUDED.is_correct`);
+        nOpts++;
+      }
+    }
+    await Promise.all(jobs);
+  }
+  console.log(`${c.name}: questions=${questions.length} bodies=${bodies.length}`);
+}
+
+// ---------------------------------------------------------------- experiences
+const skipExp = process.argv.includes('--skip-experiences');
+const exps = skipExp ? [] : (read<any[]>('data/experiences_all.json') ?? []);
+if (skipExp) console.log('skipping interview experiences (--skip-experiences)');
+let nE = 0;
+for (const e of exps) {
+  await sql`
+    INSERT INTO core.interview_experiences (
+      source_numeric_id, company_name_raw, practice_company_key, practice_company_ref,
+      interview_date, interview_type, result_raw, difficulty_raw, rounds_raw,
+      topics_asked, body_html, status, helpful_count, has_questions,
+      oacoins_awarded, proof_blob_path, reviewed_at, automated_review_id,
+      content_hash, source_created_at, source_updated_at, source_payload, updated_at)
+    VALUES (
+      ${e.source_numeric_id}, ${e.company_name_raw},
+      ${e.practice_company_key ?? null}, ${e.practice_company_ref ?? null},
+      ${e.interview_date}, ${e.interview_type}, ${e.result}, ${e.difficulty_raw},
+      ${e.rounds}, ${e.topics_asked}, ${e.experience_html},
+      ${e.status ?? 'approved'}, ${e.helpful_count ?? 0},
+      ${e.has_questions ?? false}, ${e.oacoins_awarded ?? null},
+      ${e.proof_blob_path ?? null}, ${e.reviewed_at ?? null},
+      ${e.automated_review_id ?? null},
+      ${e.experience_html ? hash(String(e.company_name_raw).toLowerCase() + String(e.experience_html).slice(0, 500)) : null},
+      ${e.source_created_at ?? null}, ${e.source_updated_at ?? null},
+      ${sql.json(e)}, now())
+    ON CONFLICT (source_numeric_id) DO UPDATE SET
+      body_html = EXCLUDED.body_html,
+      helpful_count = EXCLUDED.helpful_count,
+      content_hash = EXCLUDED.content_hash,
+      practice_company_key = EXCLUDED.practice_company_key,
+      source_updated_at = EXCLUDED.source_updated_at,
+      source_payload = EXCLUDED.source_payload,
+      updated_at = now()`;
+  nE++;
+}
+
+// ------------------------------------------------------------------ provenance
+let nR = 0;
+if (existsSync('data/raw_pages.ndjson')) {
+  const rows = readFileSync('data/raw_pages.ndjson', 'utf8')
+    .trim()
+    .split('\n')
+    .map((l) => JSON.parse(l))
+    // A manifest can list the same hash twice; dedupe so one INSERT has no
+    // duplicate ON CONFLICT targets within the batch.
+    .filter((p, i, a) => a.findIndex((x) => x.content_hash === p.content_hash) === i)
+    .map((p) => ({
+      content_hash: p.content_hash,
+      url: p.url,
+      kind: p.kind,
+      http_status: p.http_status,
+      fetched_at: p.fetched_at,
+      path: p.path,
+      byte_size: p.byte_size,
+      authenticated: p.authenticated,
+    }));
+  // Bulk insert in chunks: one round-trip per chunk instead of one per row.
+  for (let i = 0; i < rows.length; i += 500) {
+    const chunk = rows.slice(i, i + 500);
+    await sql`INSERT INTO ingest.raw_pages ${sql(chunk)} ON CONFLICT (content_hash) DO NOTHING`;
+    nR += chunk.length;
+  }
+}
+
+// Non-concurrent refresh: simpler and lock-light on first population. The
+// CONCURRENTLY variant is only needed to keep the view readable during a
+// refresh, which a batch load does not require.
+await sql`REFRESH MATERIALIZED VIEW core.company_stats`;
+
+console.log(`\ncompanies=${nC} questions=${nQ} bodies=${nB} code=${nCode}`);
+console.log(`mcq_items=${nItems} options=${nOpts} images=${nImg} topic_links=${nTopics} company_links=${nLinks}`);
+console.log(`experiences=${nE} raw_pages=${nR}`);
+
+const [{ count: qc }] = await sql`SELECT count(*)::int FROM core.questions`;
+const [{ count: ec }] = await sql`SELECT count(*)::int FROM core.interview_experiences`;
+const [{ count: oc }] = await sql`SELECT count(*)::int FROM core.question_options`;
+console.log(`\nin db: questions=${qc} experiences=${ec} options=${oc}`);
+await sql.end({ timeout: 5 });
+// Belt and braces: if a pooled socket refuses to close, do not hang the process.
+process.exit(0);
