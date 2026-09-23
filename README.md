@@ -1,4 +1,4 @@
-# oascraper
+# scraper
 
 Research scraper for **oahelper.in**, run with written permission from Next Wave.
 Builds a dataset of Online Assessment questions per company to study the variety
